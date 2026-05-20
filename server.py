@@ -23,6 +23,14 @@ try:
 except ImportError:
     _HAS_QRCODE = False
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+import os
+
 PORT = 9876
 INJECT_DELAY_SEC = 0.5  # スマホ→PCに視線を移す時間
 
@@ -167,6 +175,10 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             self._send_html()
         elif self.path == "/ping":
             self._send(200, {"status": "alive"})
+        elif self.path == "/ogp.png":
+            self._send_ogp_image()
+        elif self.path == "/icon.png":
+            self._send_icon_image()
         else:
             self._send(404, {"error": "not found"})
 
@@ -177,6 +189,14 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VoiceBridge</title>
+<!-- ファビコン -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>">
+<link rel="apple-touch-icon" href="/icon.png">
+<!-- OGP -->
+<meta property="og:title" content="VoiceBridge">
+<meta property="og:description" content="iPhoneの音声認識をPCのAIチャット入力に直接流し込むツール">
+<meta property="og:image" content="/ogp.png">
+<meta name="twitter:card" content="summary_large_image">
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, sans-serif; background: #f5f5f7;
@@ -275,6 +295,52 @@ function setStatus(msg) { document.getElementById('status').textContent = msg; }
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_ogp_image(self) -> None:
+        """OGP画像ファイルを返す（ogp.png）"""
+        ogp_path = os.path.join(os.path.dirname(__file__), "ogp.png")
+        try:
+            with open(ogp_path, "rb") as f:
+                payload = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except FileNotFoundError:
+            self._send(404, {"error": "ogp.png not found"})
+
+    def _send_icon_image(self) -> None:
+        """Apple touch icon（180×180）をオンザフライで生成"""
+        if not _HAS_PIL:
+            self._send(404, {"error": "PIL not available"})
+            return
+
+        img = Image.new("RGB", (180, 180), color="white")
+        draw = ImageDraw.Draw(img)
+
+        # 🎙のアイコンを中央に描画（テキストのみ）
+        try:
+            font = ImageFont.truetype(r"C:\Windows\Fonts\YuGothic.ttf", 120)
+        except:
+            try:
+                font = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 120)
+            except:
+                font = ImageFont.load_default()
+
+        draw.text((45, 30), "🎙", fill="black", font=font)
+
+        # PNG形式でメモリに書き込み
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        payload = buf.getvalue()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
