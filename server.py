@@ -1,0 +1,339 @@
+"""
+VoiceBridge Server
+------------------
+iOSショートカットから受け取った音声認識テキストを
+Windows のフォーカス中ウィンドウに SendInput API で注入する。
+
+使用ライブラリ: Python 標準ライブラリのみ
+対応文字: Unicode BMP 範囲（U+0000〜U+FFFF）
+ポート: 9876
+"""
+
+import ctypes
+import ctypes.wintypes
+import json
+import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+try:
+    import qrcode
+    _HAS_QRCODE = True
+except ImportError:
+    _HAS_QRCODE = False
+
+PORT = 9876
+INJECT_DELAY_SEC = 0.5  # スマホ→PCに視線を移す時間
+
+
+# ------------------------------------------------------------------
+# Windows SendInput 関連の構造体定義
+# ------------------------------------------------------------------
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL = 0x11
+VK_V = 0x56
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         ctypes.wintypes.WORD),
+        ("wScan",       ctypes.wintypes.WORD),
+        ("dwFlags",     ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("padding", ctypes.c_byte * 28),
+    ]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type",   ctypes.wintypes.DWORD),
+        ("_input", _INPUT_UNION),
+    ]
+
+_inject_lock = threading.Lock()
+
+_u32 = ctypes.windll.user32
+_k32 = ctypes.windll.kernel32
+_u32.GetClipboardData.restype   = ctypes.c_void_p
+_u32.GetClipboardData.argtypes  = [ctypes.c_uint]
+_u32.SetClipboardData.argtypes  = [ctypes.c_uint, ctypes.c_void_p]
+_k32.GlobalAlloc.restype        = ctypes.c_void_p
+_k32.GlobalAlloc.argtypes       = [ctypes.c_uint, ctypes.c_size_t]
+_k32.GlobalLock.restype         = ctypes.c_void_p
+_k32.GlobalLock.argtypes        = [ctypes.c_void_p]
+_k32.GlobalUnlock.argtypes      = [ctypes.c_void_p]
+
+def _clipboard_get() -> str:
+    if not _u32.OpenClipboard(0):
+        return ""
+    try:
+        handle = _u32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        ptr = _k32.GlobalLock(handle)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            _k32.GlobalUnlock(handle)
+    finally:
+        _u32.CloseClipboard()
+
+def _clipboard_set(text: str) -> None:
+    if not _u32.OpenClipboard(0):
+        return
+    try:
+        _u32.EmptyClipboard()
+        encoded = (text + "\0").encode("utf-16-le")
+        handle = _k32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+        ptr = _k32.GlobalLock(handle)
+        ctypes.memmove(ptr, encoded, len(encoded))
+        _k32.GlobalUnlock(handle)
+        _u32.SetClipboardData(CF_UNICODETEXT, handle)
+    finally:
+        _u32.CloseClipboard()
+
+def _send_ctrl_v() -> None:
+    events = []
+    for vk, flags in [(VK_CONTROL, 0), (VK_V, 0), (VK_V, KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP)]:
+        ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+        inp = INPUT(type=INPUT_KEYBOARD)
+        inp._input.ki = ki
+        events.append(inp)
+    arr = (INPUT * 4)(*events)
+    ctypes.windll.user32.SendInput(4, arr, ctypes.sizeof(INPUT))
+
+def send_unicode_text(text: str) -> None:
+    with _inject_lock:
+        old = _clipboard_get()
+        try:
+            _clipboard_set(text)
+            time.sleep(0.05)
+            _send_ctrl_v()
+            time.sleep(0.1)
+        finally:
+            _clipboard_set(old)
+
+
+# ------------------------------------------------------------------
+# HTTP リクエストハンドラ
+# ------------------------------------------------------------------
+
+class VoiceBridgeHandler(BaseHTTPRequestHandler):
+
+    def do_POST(self):
+        if self.path != "/input":
+            self._send(404, {"error": "not found"})
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            self._send(400, {"error": "empty body"})
+            return
+
+        try:
+            body = self.rfile.read(length)
+            data = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send(400, {"error": f"invalid JSON: {e}"})
+            return
+
+        text = data.get("text", "")
+        if not isinstance(text, str) or not text:
+            self._send(400, {"error": "text field is required"})
+            return
+
+        print(f"[RECV] {repr(text)}")
+
+        # 遅延後に注入（スマホ→PCへの視線移動を待つ）
+        time.sleep(INJECT_DELAY_SEC)
+        send_unicode_text(text)
+        print(f"[SENT] {len(text)} 文字を注入しました")
+
+        self._send(200, {"status": "ok", "length": len(text)})
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send_html()
+        elif self.path == "/ping":
+            self._send(200, {"status": "alive"})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def _send_html(self):
+        html = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceBridge</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f7;
+         display: flex; flex-direction: column; align-items: center;
+         min-height: 100vh; margin: 0; padding: 16px; }
+  h1 { font-size: 1.4rem; color: #1d1d1f; margin: 16px 0; }
+  textarea { width: 100%; max-width: 480px; height: 140px; font-size: 1.1rem;
+             padding: 12px; border: 1px solid #d2d2d7; border-radius: 12px; resize: none; }
+  #sendBtn { margin-top: 10px; width: 100%; max-width: 480px; padding: 16px;
+             font-size: 1.1rem; font-weight: 600; color: #fff; background: #007aff;
+             border: none; border-radius: 12px; cursor: pointer; }
+  #sendBtn:active { background: #0051a8; }
+  #status { margin-top: 10px; font-size: 0.9rem; color: #6e6e73; min-height: 1.2em; width: 100%; max-width: 480px; }
+  #history { margin-top: 16px; width: 100%; max-width: 480px; }
+  #history h2 { font-size: 0.85rem; color: #8e8e93; margin: 0 0 8px 4px; font-weight: 500; }
+  .hist-item { background: #fff; border: 1px solid #e5e5ea; border-radius: 10px;
+               padding: 10px 12px; margin-bottom: 8px; font-size: 1rem;
+               color: #1d1d1f; cursor: pointer; }
+  .hist-item:active { background: #f0f0f5; }
+  .hist-meta { font-size: 0.75rem; color: #8e8e93; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h1>🎙 VoiceBridge</h1>
+<textarea id="txt" placeholder="ここをタップ → キーボードのマイクボタンで話す"></textarea>
+<button id="sendBtn" onclick="send()">PCに送信</button>
+<div id="status"></div>
+<div id="history"></div>
+<script>
+const HISTORY_MAX = 3;
+let history = [];
+
+async function send() {
+  const txt = document.getElementById('txt');
+  const text = txt.value.trim();
+  if (!text) { setStatus('テキストを入力してください'); return; }
+  setStatus('送信中...');
+  try {
+    const res = await fetch('/input', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})
+    });
+    const data = await res.json();
+    if (data.status === 'ok') {
+      setStatus('✓ 送信しました（' + data.length + '文字）');
+      addHistory(text);
+      txt.value = '';
+    } else {
+      setStatus('エラー: ' + JSON.stringify(data));
+    }
+  } catch(e) {
+    setStatus('接続エラー: ' + e.message);
+  }
+}
+
+function addHistory(text) {
+  const now = new Date();
+  const time = now.getHours() + ':' + String(now.getMinutes()).padStart(2,'0');
+  history.unshift({text, time});
+  if (history.length > HISTORY_MAX) history.pop();
+  renderHistory();
+}
+
+function renderHistory() {
+  const el = document.getElementById('history');
+  if (history.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = '<h2>履歴</h2>' + history.map((h, i) =>
+    '<div class="hist-item" onclick="reuse(' + i + ')">' +
+    '<div class="hist-meta">' + h.time + '</div>' +
+    '<div>' + escHtml(h.text) + '</div></div>'
+  ).join('');
+}
+
+function reuse(i) {
+  document.getElementById('txt').value = history[i].text;
+  setStatus('履歴から読み込みました');
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+</script>
+</body>
+</html>"""
+        payload = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send(self, status: int, body: dict) -> None:
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        """標準ログを抑制してシンプルな出力にする"""
+        pass
+
+
+# ------------------------------------------------------------------
+# エントリーポイント
+# ------------------------------------------------------------------
+
+def get_local_ip() -> str:
+    """自宅WiFiのローカルIPアドレスを取得する。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+def main():
+    local_ip = get_local_ip()
+    server = HTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
+
+    print("=" * 50)
+    print("  VoiceBridge サーバー起動")
+    print("=" * 50)
+    print(f"  ローカルIP : {local_ip}")
+    print(f"  ポート     : {PORT}")
+    print(f"  エンドポイント: http://{local_ip}:{PORT}/input")
+    print(f"  疎通確認  : http://{local_ip}:{PORT}/ping")
+    print()
+    ui_url = f"http://{local_ip}:{PORT}/"
+    print("  QRをスキャンしてiPhoneで開く:")
+    print(f"    {ui_url}")
+    print()
+    if _HAS_QRCODE:
+        import sys, io
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(ui_url)
+        qr.make(fit=True)
+        utf8_out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        qr.print_ascii(out=utf8_out, invert=True)
+        utf8_out.detach()
+    print()
+    print("  停止: Ctrl+C")
+    print("=" * 50)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nサーバーを停止しました。")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
