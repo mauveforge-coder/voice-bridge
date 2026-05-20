@@ -23,13 +23,6 @@ try:
 except ImportError:
     _HAS_QRCODE = False
 
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    _HAS_PIL = True
-except ImportError:
-    _HAS_PIL = False
-
-import os
 
 PORT = 9876
 INJECT_DELAY_SEC = 0.5  # スマホ→PCに視線を移す時間
@@ -43,6 +36,7 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 VK_V = 0x56
+VK_RETURN = 0x0D
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
 
@@ -121,7 +115,17 @@ def _send_ctrl_v() -> None:
     arr = (INPUT * 4)(*events)
     ctypes.windll.user32.SendInput(4, arr, ctypes.sizeof(INPUT))
 
-def send_unicode_text(text: str) -> None:
+def _send_enter() -> None:
+    events = []
+    for vk, flags in [(VK_RETURN, 0), (VK_RETURN, KEYEVENTF_KEYUP)]:
+        ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=None)
+        inp = INPUT(type=INPUT_KEYBOARD)
+        inp._input.ki = ki
+        events.append(inp)
+    arr = (INPUT * 2)(*events)
+    ctypes.windll.user32.SendInput(2, arr, ctypes.sizeof(INPUT))
+
+def send_unicode_text(text: str, enter: bool = False) -> None:
     with _inject_lock:
         old = _clipboard_get()
         try:
@@ -129,6 +133,8 @@ def send_unicode_text(text: str) -> None:
             time.sleep(0.05)
             _send_ctrl_v()
             time.sleep(0.1)
+            if enter:
+                _send_enter()
         finally:
             _clipboard_set(old)
 
@@ -160,12 +166,13 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text:
             self._send(400, {"error": "text field is required"})
             return
+        enter = bool(data.get("enter", False))
 
-        print(f"[RECV] {repr(text)}")
+        print(f"[RECV] {repr(text)} enter={enter}")
 
         # 遅延後に注入（スマホ→PCへの視線移動を待つ）
         time.sleep(INJECT_DELAY_SEC)
-        send_unicode_text(text)
+        send_unicode_text(text, enter=enter)
         print(f"[SENT] {len(text)} 文字を注入しました")
 
         self._send(200, {"status": "ok", "length": len(text)})
@@ -175,10 +182,7 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             self._send_html()
         elif self.path == "/ping":
             self._send(200, {"status": "alive"})
-        elif self.path == "/ogp.png":
-            self._send_ogp_image()
-        elif self.path == "/icon.png":
-            self._send_icon_image()
+
         else:
             self._send(404, {"error": "not found"})
 
@@ -191,12 +195,6 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <title>VoiceBridge</title>
 <!-- ファビコン -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>">
-<link rel="apple-touch-icon" href="/icon.png">
-<!-- OGP -->
-<meta property="og:title" content="VoiceBridge">
-<meta property="og:description" content="iPhoneの音声認識をPCのAIチャット入力に直接流し込むツール">
-<meta property="og:image" content="/ogp.png">
-<meta name="twitter:card" content="summary_large_image">
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, sans-serif; background: #f5f5f7;
@@ -210,6 +208,9 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
              border: none; border-radius: 12px; cursor: pointer; }
   #sendBtn:active { background: #0051a8; }
   #status { margin-top: 10px; font-size: 0.9rem; color: #6e6e73; min-height: 1.2em; width: 100%; max-width: 480px; }
+  .toggle-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; width: 100%; max-width: 480px; }
+  .toggle-row label { font-size: 0.95rem; color: #3a3a3c; }
+  input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; }
   #history { margin-top: 16px; width: 100%; max-width: 480px; }
   #history h2 { font-size: 0.85rem; color: #8e8e93; margin: 0 0 8px 4px; font-weight: 500; }
   .hist-item { background: #fff; border: 1px solid #e5e5ea; border-radius: 10px;
@@ -223,6 +224,10 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <h1>🎙 VoiceBridge</h1>
 <textarea id="txt" placeholder="ここをタップ → キーボードのマイクボタンで話す"></textarea>
 <button id="sendBtn" onclick="send()">PCに送信</button>
+<div class="toggle-row">
+  <input type="checkbox" id="enterChk">
+  <label for="enterChk">送信後にEnterを押す</label>
+</div>
 <div id="status"></div>
 <div id="history"></div>
 <script>
@@ -233,12 +238,13 @@ async function send() {
   const txt = document.getElementById('txt');
   const text = txt.value.trim();
   if (!text) { setStatus('テキストを入力してください'); return; }
+  const enter = document.getElementById('enterChk').checked;
   setStatus('送信中...');
   try {
     const res = await fetch('/input', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text})
+      body: JSON.stringify({text, enter})
     });
     const data = await res.json();
     if (data.status === 'ok') {
@@ -295,52 +301,6 @@ function setStatus(msg) { document.getElementById('status').textContent = msg; }
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _send_ogp_image(self) -> None:
-        """OGP画像ファイルを返す（ogp.png）"""
-        ogp_path = os.path.join(os.path.dirname(__file__), "ogp.png")
-        try:
-            with open(ogp_path, "rb") as f:
-                payload = f.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        except FileNotFoundError:
-            self._send(404, {"error": "ogp.png not found"})
-
-    def _send_icon_image(self) -> None:
-        """Apple touch icon（180×180）をオンザフライで生成"""
-        if not _HAS_PIL:
-            self._send(404, {"error": "PIL not available"})
-            return
-
-        img = Image.new("RGB", (180, 180), color="white")
-        draw = ImageDraw.Draw(img)
-
-        # 🎙のアイコンを中央に描画（テキストのみ）
-        try:
-            font = ImageFont.truetype(r"C:\Windows\Fonts\YuGothic.ttf", 120)
-        except:
-            try:
-                font = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 120)
-            except:
-                font = ImageFont.load_default()
-
-        draw.text((45, 30), "🎙", fill="black", font=font)
-
-        # PNG形式でメモリに書き込み
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        payload = buf.getvalue()
-
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
