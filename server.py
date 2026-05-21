@@ -11,6 +11,7 @@ Windows のフォーカス中ウィンドウに SendInput API で注入する。
 
 import ctypes
 import ctypes.wintypes
+import io
 import json
 import re
 import secrets
@@ -36,6 +37,7 @@ RATE_LIMIT_SEC = 1.0
 
 _SESSION_TOKEN: str = secrets.token_hex(8)
 _allowed_ip: str | None = None
+_ip_locked: bool = False
 _allowed_ip_lock = threading.Lock()
 _last_inject_time: float = 0.0
 _rate_lock = threading.Lock()
@@ -188,8 +190,13 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             if now - _last_inject_time < RATE_LIMIT_SEC:
                 self._send(429, {"error": "rate limit exceeded"})
                 return
+            _last_inject_time = now
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._send(400, {"error": "invalid Content-Length"})
+            return
         if length == 0:
             self._send(400, {"error": "empty body"})
             return
@@ -213,19 +220,13 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             return
         enter = bool(data.get("enter", False))
 
-        print(f"[RECV] {repr(text)} enter={enter}")
-
-        # スリープ・注入完了後に更新することで、前回注入完了時刻ベースのレート制限を実現する
-        with _rate_lock:
-            time.sleep(INJECT_DELAY_SEC)
-            send_unicode_text(text, enter=enter)
-            _last_inject_time = time.time()
-        print(f"[SENT] {len(text)} 文字を注入しました")
+        time.sleep(INJECT_DELAY_SEC)
+        send_unicode_text(text, enter=enter)
 
         self._send(200, {"status": "ok", "length": len(text)})
 
     def do_GET(self):
-        global _allowed_ip
+        global _allowed_ip, _ip_locked
 
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
@@ -236,10 +237,18 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
                 self._send(403, {"error": "invalid token"})
                 return
             with _allowed_ip_lock:
+                if _ip_locked:
+                    self._send(403, {"error": "already registered"})
+                    return
                 _allowed_ip = self.client_address[0]
+                _ip_locked = True
             print(f"[AUTH] 端末を登録しました: {_allowed_ip}")
             self._send_html()
         elif parsed.path == "/ping":
+            with _allowed_ip_lock:
+                if _allowed_ip is None or self.client_address[0] != _allowed_ip:
+                    self._send(403, {"error": "forbidden"})
+                    return
             self._send(200, {"status": "alive"})
         else:
             self._send(404, {"error": "not found"})
@@ -289,8 +298,9 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <div id="history"></div>
 <script>
 const TOKEN = '__SESSION_TOKEN__';
+history.replaceState(null, '', '/');
 const HISTORY_MAX = 3;
-let history = [];
+let historyList = [];
 
 async function send() {
   const txt = document.getElementById('txt');
@@ -320,15 +330,15 @@ async function send() {
 function addHistory(text) {
   const now = new Date();
   const time = now.getHours() + ':' + String(now.getMinutes()).padStart(2,'0');
-  history.unshift({text, time});
-  if (history.length > HISTORY_MAX) history.pop();
+  historyList.unshift({text, time});
+  if (historyList.length > HISTORY_MAX) historyList.pop();
   renderHistory();
 }
 
 function renderHistory() {
   const el = document.getElementById('history');
-  if (history.length === 0) { el.innerHTML = ''; return; }
-  el.innerHTML = '<h2>履歴</h2>' + history.map((h, i) =>
+  if (historyList.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = '<h2>履歴</h2>' + historyList.map((h, i) =>
     '<div class="hist-item" onclick="reuse(' + i + ')">' +
     '<div class="hist-meta">' + h.time + '</div>' +
     '<div>' + escHtml(h.text) + '</div></div>'
@@ -336,7 +346,7 @@ function renderHistory() {
 }
 
 function reuse(i) {
-  document.getElementById('txt').value = history[i].text;
+  document.getElementById('txt').value = historyList[i].text;
   setStatus('履歴から読み込みました');
 }
 
@@ -383,11 +393,12 @@ def get_local_ip() -> str:
 
 
 def _find_port_listeners(port: int) -> list[int]:
-    """指定ポートをLISTENしているPIDの一覧を返す。"""
+    """指定ポートをLISTENしているPIDの一覧を返す（PID表示用）。"""
     pids: list[int] = []
     try:
+        netstat = r"C:\Windows\System32\netstat.exe"
         out = subprocess.check_output(
-            ["netstat", "-ano"],
+            [netstat, "-ano"],
             text=True,
             encoding="utf-8",
             errors="ignore",
@@ -403,27 +414,41 @@ def _find_port_listeners(port: int) -> list[int]:
     return list(set(pids))
 
 
+class _ExclusiveHTTPServer(HTTPServer):
+    """SO_REUSEADDR を無効にし、ポート二重起動を OS レベルで防ぐ。"""
+    allow_reuse_address = False
+
+
 def main():
-    # 起動前ポート競合チェック
-    conflicting = _find_port_listeners(PORT)
-    if conflicting:
-        print(f"\n[警告] ポート {PORT} を使用中のプロセスが見つかりました (PID: {', '.join(map(str, conflicting))})")
+    local_ip = get_local_ip()
+
+    # ポートへの bind を試みる。既に使用中なら OS がエラーを返す。
+    try:
+        server = _ExclusiveHTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
+    except OSError:
+        conflicting = _find_port_listeners(PORT)
+        pid_str = f" (PID: {', '.join(map(str, conflicting))})" if conflicting else ""
+        print(f"\n[ERROR] ポート {PORT} は既に使用中です{pid_str}")
         print("  古いVoiceBridgeが残っている可能性があります。")
         ans = input("  自動的に停止してから起動しますか？ [y/N]: ").strip().lower()
-        if ans == "y":
-            for pid in conflicting:
-                try:
-                    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                                   capture_output=True, check=True)
-                    print(f"  → PID {pid} を停止しました")
-                except Exception as e:
-                    print(f"  → PID {pid} の停止に失敗しました: {e}")
-        else:
+        if ans != "y":
             print("  手動で停止してから再起動してください。終了します。")
             sys.exit(1)
-
-    local_ip = get_local_ip()
-    server = HTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
+        for pid in conflicting:
+            try:
+                subprocess.run(
+                    [r"C:\Windows\System32\taskkill.exe", "/PID", str(pid), "/F"],
+                    capture_output=True, check=True,
+                )
+                print(f"  → PID {pid} を停止しました")
+            except Exception as e:
+                print(f"  → PID {pid} の停止に失敗しました: {e}")
+                sys.exit(1)
+        try:
+            server = _ExclusiveHTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
+        except OSError:
+            print(f"[ERROR] ポート {PORT} の解放に失敗しました。手動で停止してください。")
+            sys.exit(1)
 
     ui_url = f"http://{local_ip}:{PORT}/?t={_SESSION_TOKEN}"
 
@@ -438,7 +463,6 @@ def main():
     print(f"    {ui_url}")
     print()
     if _HAS_QRCODE:
-        import sys, io
         qr = qrcode.QRCode(border=1)
         qr.add_data(ui_url)
         qr.make(fit=True)

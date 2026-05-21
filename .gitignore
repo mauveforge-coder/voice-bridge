@@ -68,3 +68,7 @@ venv.bak/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Dev tools
+verification_checklist.html
+icon_preview.png
