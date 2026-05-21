@@ -12,8 +12,11 @@ Windows のフォーカス中ウィンドウに SendInput API で注入する。
 import ctypes
 import ctypes.wintypes
 import json
+import re
 import secrets
 import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -368,7 +371,46 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def _find_port_listeners(port: int) -> list[int]:
+    """指定ポートをLISTENしているPIDの一覧を返す。"""
+    pids: list[int] = []
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        for line in out.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                m = re.search(r"\s(\d+)\s*$", line.strip())
+                if m and int(m.group(1)) != 0:
+                    pids.append(int(m.group(1)))
+    except Exception:
+        pass
+    return list(set(pids))
+
+
 def main():
+    # 起動前ポート競合チェック
+    conflicting = _find_port_listeners(PORT)
+    if conflicting:
+        print(f"\n[警告] ポート {PORT} を使用中のプロセスが見つかりました (PID: {', '.join(map(str, conflicting))})")
+        print("  古いVoiceBridgeが残っている可能性があります。")
+        ans = input("  自動的に停止してから起動しますか？ [y/N]: ").strip().lower()
+        if ans == "y":
+            for pid in conflicting:
+                try:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                                   capture_output=True, check=True)
+                    print(f"  → PID {pid} を停止しました")
+                except Exception as e:
+                    print(f"  → PID {pid} の停止に失敗しました: {e}")
+        else:
+            print("  手動で停止してから再起動してください。終了します。")
+            sys.exit(1)
+
     local_ip = get_local_ip()
     server = HTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
 
