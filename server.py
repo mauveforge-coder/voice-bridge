@@ -30,7 +30,7 @@ except ImportError:
 
 
 PORT = 9876
-INJECT_DELAY_SEC = 0.5
+INJECT_DELAY_SEC = 0.3
 MAX_TEXT_LENGTH = 10_000
 RATE_LIMIT_SEC = 1.0
 
@@ -111,7 +111,13 @@ def _clipboard_set(text: str) -> None:
         _u32.EmptyClipboard()
         encoded = (text + "\0").encode("utf-16-le")
         handle = _k32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+        if not handle:
+            return
         ptr = _k32.GlobalLock(handle)
+        if not ptr:
+            _k32.GlobalFree(handle)
+            print("[ERROR] GlobalLock failed")
+            return
         ctypes.memmove(ptr, encoded, len(encoded))
         _k32.GlobalUnlock(handle)
         _u32.SetClipboardData(CF_UNICODETEXT, handle)
@@ -182,11 +188,13 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
             if now - _last_inject_time < RATE_LIMIT_SEC:
                 self._send(429, {"error": "rate limit exceeded"})
                 return
-            _last_inject_time = now
 
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             self._send(400, {"error": "empty body"})
+            return
+        if length > MAX_TEXT_LENGTH * 4:
+            self._send(413, {"error": "request too large"})
             return
 
         try:
@@ -207,8 +215,11 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 
         print(f"[RECV] {repr(text)} enter={enter}")
 
-        time.sleep(INJECT_DELAY_SEC)
-        send_unicode_text(text, enter=enter)
+        # スリープ・注入完了後に更新することで、前回注入完了時刻ベースのレート制限を実現する
+        with _rate_lock:
+            time.sleep(INJECT_DELAY_SEC)
+            send_unicode_text(text, enter=enter)
+            _last_inject_time = time.time()
         print(f"[SENT] {len(text)} 文字を注入しました")
 
         self._send(200, {"status": "ok", "length": len(text)})
@@ -432,8 +443,10 @@ def main():
         qr.add_data(ui_url)
         qr.make(fit=True)
         utf8_out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-        qr.print_ascii(out=utf8_out, invert=True)
-        utf8_out.detach()
+        try:
+            qr.print_ascii(out=utf8_out, invert=True)
+        finally:
+            utf8_out.detach()
     print()
     print("  停止: Ctrl+C")
     print("=" * 50)
