@@ -12,9 +12,11 @@ Windows のフォーカス中ウィンドウに SendInput API で注入する。
 import ctypes
 import ctypes.wintypes
 import json
+import secrets
 import socket
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:
@@ -25,7 +27,15 @@ except ImportError:
 
 
 PORT = 9876
-INJECT_DELAY_SEC = 0.5  # スマホ→PCに視線を移す時間
+INJECT_DELAY_SEC = 0.5
+MAX_TEXT_LENGTH = 10_000
+RATE_LIMIT_SEC = 1.0
+
+_SESSION_TOKEN: str = secrets.token_hex(8)
+_allowed_ip: str | None = None
+_allowed_ip_lock = threading.Lock()
+_last_inject_time: float = 0.0
+_rate_lock = threading.Lock()
 
 
 # ------------------------------------------------------------------
@@ -145,10 +155,31 @@ def send_unicode_text(text: str, enter: bool = False) -> None:
 
 class VoiceBridgeHandler(BaseHTTPRequestHandler):
 
+    def _check_auth(self) -> bool:
+        """登録済みIPアドレスとセッショントークンの両方を検証する。"""
+        with _allowed_ip_lock:
+            if _allowed_ip is None or self.client_address[0] != _allowed_ip:
+                return False
+        token = self.headers.get("X-VoiceBridge-Token", "")
+        return secrets.compare_digest(token, _SESSION_TOKEN)
+
     def do_POST(self):
+        global _last_inject_time
+
         if self.path != "/input":
             self._send(404, {"error": "not found"})
             return
+
+        if not self._check_auth():
+            self._send(403, {"error": "forbidden"})
+            return
+
+        with _rate_lock:
+            now = time.time()
+            if now - _last_inject_time < RATE_LIMIT_SEC:
+                self._send(429, {"error": "rate limit exceeded"})
+                return
+            _last_inject_time = now
 
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
@@ -166,11 +197,13 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
         if not isinstance(text, str) or not text:
             self._send(400, {"error": "text field is required"})
             return
+        if len(text) > MAX_TEXT_LENGTH:
+            self._send(400, {"error": f"text too long (max {MAX_TEXT_LENGTH})"})
+            return
         enter = bool(data.get("enter", False))
 
         print(f"[RECV] {repr(text)} enter={enter}")
 
-        # 遅延後に注入（スマホ→PCへの視線移動を待つ）
         time.sleep(INJECT_DELAY_SEC)
         send_unicode_text(text, enter=enter)
         print(f"[SENT] {len(text)} 文字を注入しました")
@@ -178,11 +211,22 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
         self._send(200, {"status": "ok", "length": len(text)})
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self._send_html()
-        elif self.path == "/ping":
-            self._send(200, {"status": "alive"})
+        global _allowed_ip
 
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path in ("/", "/index.html"):
+            token = params.get("t", [""])[0]
+            if not secrets.compare_digest(token, _SESSION_TOKEN):
+                self._send(403, {"error": "invalid token"})
+                return
+            with _allowed_ip_lock:
+                _allowed_ip = self.client_address[0]
+            print(f"[AUTH] 端末を登録しました: {_allowed_ip}")
+            self._send_html()
+        elif parsed.path == "/ping":
+            self._send(200, {"status": "alive"})
         else:
             self._send(404, {"error": "not found"})
 
@@ -193,7 +237,6 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VoiceBridge</title>
-<!-- ファビコン -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>">
 <style>
   * { box-sizing: border-box; }
@@ -231,6 +274,7 @@ class VoiceBridgeHandler(BaseHTTPRequestHandler):
 <div id="status"></div>
 <div id="history"></div>
 <script>
+const TOKEN = '__SESSION_TOKEN__';
 const HISTORY_MAX = 3;
 let history = [];
 
@@ -243,7 +287,7 @@ async function send() {
   try {
     const res = await fetch('/input', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {'Content-Type': 'application/json', 'X-VoiceBridge-Token': TOKEN},
       body: JSON.stringify({text, enter})
     });
     const data = await res.json();
@@ -289,7 +333,7 @@ function escHtml(s) {
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 </script>
 </body>
-</html>"""
+</html>""".replace("__SESSION_TOKEN__", _SESSION_TOKEN)
         payload = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -306,7 +350,6 @@ function setStatus(msg) { document.getElementById('status').textContent = msg; }
         self.wfile.write(payload)
 
     def log_message(self, fmt, *args):
-        """標準ログを抑制してシンプルな出力にする"""
         pass
 
 
@@ -315,7 +358,6 @@ function setStatus(msg) { document.getElementById('status').textContent = msg; }
 # ------------------------------------------------------------------
 
 def get_local_ip() -> str:
-    """自宅WiFiのローカルIPアドレスを取得する。"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -330,15 +372,15 @@ def main():
     local_ip = get_local_ip()
     server = HTTPServer(("0.0.0.0", PORT), VoiceBridgeHandler)
 
+    ui_url = f"http://{local_ip}:{PORT}/?t={_SESSION_TOKEN}"
+
     print("=" * 50)
     print("  VoiceBridge サーバー起動")
     print("=" * 50)
     print(f"  ローカルIP : {local_ip}")
     print(f"  ポート     : {PORT}")
-    print(f"  エンドポイント: http://{local_ip}:{PORT}/input")
-    print(f"  疎通確認  : http://{local_ip}:{PORT}/ping")
+    print(f"  トークン   : {_SESSION_TOKEN}")
     print()
-    ui_url = f"http://{local_ip}:{PORT}/"
     print("  QRをスキャンしてiPhoneで開く:")
     print(f"    {ui_url}")
     print()
